@@ -1,329 +1,207 @@
+import pickle
 import numpy as np
-import matplotlib.pyplot as plt
-
-np.random.seed(3)
-
-#remove error when divide 0 by 0 when doing the finite difference gradient check
-np.seterr(divide='ignore', invalid='ignore')
 
 
-circles = np.loadtxt('circles.txt')
+class NN(object):
+    def __init__(self,
+                 hidden_dims=(512, 256),
+                 datapath='cifar10.pkl',
+                 n_classes=10,
+                 epsilon=1e-6,
+                 lr=7e-4,
+                 batch_size=1000,
+                 seed=None,
+                 activation="relu",
+                 init_method="glorot"
+                 ):
 
-n_classes = 2
-n_train = 880
-target_ind = [circles.shape[1] - 1]
-inds = np.arange(circles.shape[0])
-np.random.shuffle(inds)
-train_inds = inds[:n_train]
-test_inds = inds[n_train:]
-train_set = circles[train_inds, :]
-test_set = circles[test_inds, :]
-train_inputs = train_set[:,:-1]
-train_labels = train_set[:,-1]
-test_inputs = test_set[:,:-1]
-test_labels = test_set[:,-1]
+        self.hidden_dims = hidden_dims
+        self.n_hidden = len(hidden_dims)
+        self.datapath = datapath
+        self.n_classes = n_classes
+        self.lr = lr
+        self.batch_size = batch_size
+        self.init_method = init_method
+        self.seed = seed
+        self.activation_str = activation
+        self.epsilon = epsilon
 
+        self.train_logs = {'train_accuracy': [], 'validation_accuracy': [], 'train_loss': [], 'validation_loss': []}
 
+        if datapath is not None:
+            u = pickle._Unpickler(open(datapath, 'rb'))
+            u.encoding = 'latin1'
+            self.train, self.valid, self.test = u.load()
+        else:
+            self.train, self.valid, self.test = None, None, None
 
-class Neural_network:
+    def get_weight(self,key):
+        return self.weights[key].T
 
-    def __init__(self, d, dh, m, epoch = 100, step_size= 0.01, k = 1, lambda11 = 0, lambda12 = 0, lambda21 = 0, lambda22 = 0):
-        self.d = d # number of features
-        self.dh = dh # number of neurons in the hidden layer
-        self.m = m # number of class = number of neurons in the last layer (output layer)
-        self.step_size = step_size
-        self.epoch = epoch
-        self.b1 = np.zeros((dh,1))
-        self.w1 = initialize_weight(d,dh)
-        self.b2 = np.zeros((m,1))
-        self.w2 = initialize_weight(dh,m)
-        self.minibatch_size = k  # size of minibatch
-        self.lambda11 = lambda11
-        self.lambda12 = lambda12
-        self.lambda21 = lambda21
-        self.lambda22 = lambda22
+    def initialize_weights(self, dims):
+        if self.seed is not None:
+            np.random.seed(self.seed)
 
-    def weight_decay(self,w):
-        if w == 'w1':
-            return self.lambda11*np.sign(self.w1) + 2*self.lambda12*self.w1
-        elif w == 'w2':
-            return self.lambda21*np.sign(self.w2) + 2*self.lambda22*self.w2
+        self.weights = {}
+        # self.weights is a dictionary with keys W1, b1, W2, b2, ..., Wm, Bm where m - 1 is the number of hidden layers
+        all_dims = [dims[0]] + list(self.hidden_dims) + [dims[1]]
+        for layer_n in range(1, self.n_hidden + 2):
+            self.weights[f"W{layer_n}"] = np.random.uniform(-1 / (all_dims[layer_n-1] ** (0.5)), 1 / (all_dims[layer_n-1]  ** (0.5)), (all_dims[layer_n-1], all_dims[layer_n]))
+            self.weights[f"b{layer_n}"] = np.zeros((1, all_dims[layer_n]))
 
-    def fprop(self,x,y = None):
-        self.ha = self.b1 + np.dot(self.w1,x)
-        self.hs = self.ha.clip(min=0)
-        self.oa = self.b2 + np.dot(self.w2,self.hs)
-        self.os = softmax(self.oa)
+    def relu(self, x, grad=False):
+        if grad:
+            return np.greater(x, 0).astype(float)
+        return np.maximum(x, 0)
 
-    def bprop(self,x,y):
-        grad_b2 = self.os - np.eye(self.m)[y].reshape((self.m,1))
-        grad_w2 = np.outer(self.os, self.hs)
-        for i in range(self.hs.shape[0]):
-            grad_w2[y][i] = grad_w2[y][i] - self.hs[i]
-        grad_hs = np.dot(self.w2.T,self.os) - self.w2[y,:].reshape((self.dh,1))
-        indicator = np.sign(self.hs).clip(min=0)
-        grad_ha = np.multiply(grad_hs,indicator)
-        grad_b1 = grad_ha
-        grad_w1 = np.outer(grad_ha,x)
-        return np.array([grad_b1, grad_w1, grad_b2, grad_w2])
+    def sigmoid(self, x, grad=False):
+        if not isinstance(x, np.ndarray):
+            x = np.array(x)
+        if grad:
+            sig = self.sigmoid(x, False)
+            return sig - sig ** 2
+        return 1 / (1 + np.exp(-x))
 
-    def gradient_descent(self,grad_b1, grad_w1, grad_b2, grad_w2):
-        self.w1 = self.w1 - self.step_size*(grad_w1 + self.weight_decay('w1'))
-        self.b1 = self.b1 - self.step_size*grad_b1
-        self.w2 = self.w2 - self.step_size * (grad_w2 + self.weight_decay('w2'))
-        self.b2 = self.b2 - self.step_size * grad_b2
+    def tanh(self, x, grad=False):
+        if grad:
+            return 1 - np.tanh(x) ** 2
+        return np.tanh(x)
 
-    # only use to debug the gradient_descent and back prop
-    def gradient_check(self,x,y, debug = False):
-        # use two-sided difference estimate instead of the one-sided difference
-        epsilon = 0.00001
-        y = int(y)
-        x = x.reshape((self.d, 1))
+    def activation(self, x, grad=False):
+        if self.activation_str == "relu":
+            return self.relu(x,grad)
+        elif self.activation_str == "sigmoid":
+            return self.sigmoid(x, grad)
+        elif self.activation_str == "tanh":
+            return self.tanh(x, grad)
+        else:
+            raise Exception("invalid")
+        return 0
 
-        self.fprop(x,y)
-        computed = self.bprop(x,y)
+    def softmax(self, x):
+        # x is a vector or batch_size × n_dimensions
+        # Remember that softmax(x-C) = softmax(x) when C is a constant.
+        max = np.max(x, axis=-1)  # find the max of each rows
+        if len(x.shape) > 1:  # if x is batch_size × n_dimensions, add a dimension to broadcast substration
+            max = max[:, np.newaxis]
+        x = x - max
+        x = np.exp(x)
+        sum = np.sum(x, axis=-1)
+        if len(x.shape) > 1:  # if x is batch_size × n_dimensions, add a dimension to broadcast division
+            sum = sum[:, np.newaxis]
+        x = x / sum
+        return x
 
-        #gradient check for b1
-        grad_b1_check = np.zeros((self.dh,1))
-        for i in range(self.b1.shape[0]):
-            b1plus = np.copy(self.b1)
-            b1plus[i] = self.b1[i] + epsilon
-            b1minus = np.copy(self.b1)
-            b1minus[i] = self.b1[i] - epsilon
-            grad_b1_check[i] = (self.loss_check(x=x, y=y, b1=b1plus) - self.loss_check(x=x, y=y, b1=b1minus)) / (2*epsilon)
+    def forward(self, x):
+        cache = {"Z0": x}
+        # cache is a dictionary with keys Z0, A0, ..., ZL, AL where L - 1 is the number of hidden layers
+        # Ai corresponds to the preactivation at layer i, Zi corresponds to the activation at layer i
+        for layer_n in range(1, self.n_hidden+1): #each hidden layers
+            cache[f"A{layer_n}"] = self.weights[f"b{layer_n}"] + np.dot(cache[f"Z{layer_n-1}"], self.weights[f"W{layer_n}"])
+            cache[f"Z{layer_n}"] = self.activation(cache[f"A{layer_n}"])
+        #output layer
+        cache[f"A{self.n_hidden+1}"] = self.weights[f"b{self.n_hidden+1}"] + np.dot(cache[f"Z{self.n_hidden}"], self.weights[f"W{self.n_hidden+1}"])
+        cache[f"Z{self.n_hidden+1}"] = self.softmax(cache[f"A{self.n_hidden+1}"])
+        return cache
 
-        # gradient check for b2
-        grad_b2_check = np.zeros(self.b2.shape)
-        for i in range(self.b2.shape[0]):
-            b2plus = np.copy(self.b2)
-            b2plus[i] = self.b2[i] + epsilon
-            b2minus = np.copy(self.b2)
-            b2minus[i] = self.b2[i] - epsilon
-            grad_b2_check[i] = (self.loss_check(x=x, y=y, b2=b2plus) - self.loss_check(x=x, y=y, b2=b2minus)) / (2 * epsilon)
+    def backward(self, cache, labels):
+        output = cache[f"Z{self.n_hidden + 1}"] #(nb samples, m)
+        grads = {}
+        if len(np.squeeze(cache["Z0"]).shape) == 1:
+            nb_samples = 1
+            cache["Z0"] = cache["Z0"][np.newaxis, :] #change shape (d,) to (1,d) so code below works for any nb_samples (even 1) the same way by using the standard shape (nb samples, d)
+        else:
+            nb_samples = cache["Z0"].shape[0]
+        # grads is a dictionary with keys dAL, dWL, dbL, dZ(L-1), dA(L-1), ..., dW1, db1
+        grads[f"dA{self.n_hidden + 1}"] = output - labels #(nb samples, m)
+        grads[f"dW{self.n_hidden + 1}"] = np.dot(cache[f"Z{self.n_hidden}"].T, grads[f"dA{self.n_hidden + 1}"]) / nb_samples #correct? #mean where: np.dot(Z(L-1).T, dAL) where Z(L-1)=(nb samples, d_{L-1}), dAL=(nb samples, m) and result is (d_{L-1}, m)
+        grads[f"db{self.n_hidden + 1}"] = np.mean(grads[f"dA{self.n_hidden + 1}"], axis=0)[np.newaxis, :] #average on samples of dAL=(nb samples, m)
 
-        #gradient check for w1
-        grad_w1_check = np.zeros(self.w1.shape)
-        for i in range(self.w1.shape[0]):
-            for j in range(self.w1.shape[1]):
-                w1plus = np.copy(self.w1)
-                w1plus[i,j] = self.w1[i,j] + epsilon
-                w1minus = np.copy(self.w1)
-                w1minus[i,j] = self.w1[i,j] - epsilon
-                grad_w1_check[i,j] = (self.loss_check(x=x, y=y, w1=w1plus) - self.loss_check(x=x, y=y, w1=w1minus)) / (2*epsilon)
+        for layer_n in range(self.n_hidden, 0, -1):
+            grads[f"dZ{layer_n}"] = np.dot(grads[f"dA{layer_n+1}"], self.weights[f"W{layer_n+1}"].T) # np.dot(dA(Layer+1), W(Layer+1).T) where dA(layer+1)=(nb samples, d_{Layer+1}), W(Layer+1)=(d_{Layer},d_{Layer+1}) and results=(nb samples, d_{Layer})
+            grads[f"dA{layer_n}"] = np.multiply(self.activation(cache[f"A{layer_n}"],grad=True), grads[f"dZ{layer_n}"]) #element wise
+            grads[f"dW{layer_n}"] = np.dot(cache[f"Z{layer_n-1}"].T, grads[f"dA{layer_n}"]) / nb_samples
+            grads[f"db{layer_n}"] = np.mean(grads[f"dA{layer_n}"], axis=0)[np.newaxis, :] #add a dimension because gradescope check if it is the same shape. So, vectors of shape (n,) != (n,1) are rejected, but (1,n) is accepted even if they are all valid
 
-        # gradient check for w2
-        grad_w2_check = np.zeros(self.w2.shape)
-        for i in range(self.w2.shape[0]):
-            for j in range(self.w2.shape[1]):
-                w2plus = np.copy(self.w2)
-                w2plus[i, j] = self.w2[i, j] + epsilon
-                w2minus = np.copy(self.w2)
-                w2minus[i, j] = self.w2[i, j] - epsilon
-                grad_w2_check[i, j] = (self.loss_check(x=x, y=y, w2=w2plus) - self.loss_check(x=x, y=y, w2=w2minus)) / (2*epsilon)
-
-        grads = np.array([grad_b1_check, grad_w1_check, grad_b2_check, grad_w2_check])
-
-        if debug:
-            show_grads(computed=computed, estimate=grads)
-
+        cache["Z0"] = np.squeeze(cache["Z0"]) #remove dimension added to compute grads
         return grads
 
-    def loss_check(self, x, y, b1 = None, b2 = None, w1 = None, w2 = None):
-        if b1 is None:
-            b1 = self.b1
-        if b2 is None:
-            b2 = self.b2
-        if w1 is None:
-            w1 = self.w1
-        if w2 is None:
-            w2 = self.w2
-        ha = b1 + np.dot(w1, x)
-        hs = ha.clip(min=0)
-        oa = b2 + np.dot(w2, hs)
-        os = softmax(oa)
-        return - np.log(os[y])
+    def update(self, grads):
+        for layer in range(1, self.n_hidden + 2):
+            self.weights[f"W{layer}"] -= self.lr * grads[f"dW{layer}"]
+            self.weights[f"b{layer}"] -= self.lr * grads[f"db{layer}"]
 
-    def gradient_check_minibatch(self, minibatch_inputs,minibatch_labels):
-        computed = self.train_minibatch(minibatch_inputs, minibatch_labels.astype(int), True)
+    def one_hot(self, y):
+        return np.eye(self.n_classes)[y]
 
-        total_b1 = np.zeros((self.dh, 1))
-        total_w1 = np.zeros((self.dh, self.d))
-        total_b2 = np.zeros((self.m, 1))
-        total_w2 = np.zeros((self.m, self.dh))
-        grads = np.array([total_b1, total_w1, total_b2, total_w2])
+    def loss(self, prediction, labels):
+        prediction[np.where(prediction < self.epsilon)] = self.epsilon
+        prediction[np.where(prediction > 1 - self.epsilon)] = 1 - self.epsilon
+        return -np.sum(labels * np.log(prediction))/labels.shape[0]
 
-        # sum gradient from the k examples
-        for i in range(minibatch_inputs.shape[0]):
-            grads += self.gradient_check(x=minibatch_inputs[i], y=minibatch_labels[i])
+    def compute_loss_and_accuracy(self, X, y):
+        one_y = self.one_hot(y)
+        cache = self.forward(X)
+        predictions = np.argmax(cache[f"Z{self.n_hidden + 1}"], axis=1)
+        accuracy = np.mean(y == predictions)
+        loss = self.loss(cache[f"Z{self.n_hidden + 1}"], one_y)
+        return loss, accuracy, predictions
 
-        # use average estimated gradients of the minibatch
-        grads = grads / minibatch_inputs.shape[0]
+    def train_loop(self, n_epochs):
+        X_train, y_train = self.train
+        y_onehot = self.one_hot(y_train)
+        dims = [X_train.shape[1], y_onehot.shape[1]]
+        self.initialize_weights(dims)
 
-        show_grads(computed = computed, estimate = grads)
+        n_batches = int(np.ceil(X_train.shape[0] / self.batch_size))
 
-    def train(self,train_inputs, train_labels):
-        train_labels = train_labels.astype(int)
-        for l in range(self.epoch):
-            #separate the dataset in minibatch with k examples
-            for i in range(train_inputs.shape[0]//self.minibatch_size):
-                s = i * self.minibatch_size #start index of the current minibatch
-                e = (i + 1) * self.minibatch_size #end index of the current minibatch
-                self.train_minibatch( minibatch_inputs = train_inputs[s:e, :], minibatch_labels  = train_labels[s:e])
+        for epoch in range(n_epochs):
+            for batch in range(n_batches):
+                minibatchX = X_train[self.batch_size * batch:self.batch_size * (batch + 1), :]
+                minibatchY = y_onehot[self.batch_size * batch:self.batch_size * (batch + 1), :]
 
-            #if the numbers of examples in the trainning dataset is not a multiple of minibatch_size
-            # take care of the last minibatch that cant have minibatch_size examples
-            if (train_inputs.shape[0] % self.minibatch_size) != 0:
-                s = (train_inputs.shape[0] // self.minibatch_size) * self.minibatch_size
-                self.train_minibatch(minibatch_inputs = train_inputs[s:, :], minibatch_labels = train_labels[s:])
+                cache = self.forward(minibatchX)
+                grads = self.backward(cache, minibatchY)
+                self.update(grads)
 
-    def train_minibatch(self, minibatch_inputs, minibatch_labels, debug = False):
-        total_b1 = np.zeros((self.dh,1))
-        total_w1 = np.zeros((self.dh,self.d))
-        total_b2 = np.zeros((self.m,1))
-        total_w2 = np.zeros((self.m,self.dh))
-        grads = np.array([total_b1, total_w1, total_b2, total_w2])
+            X_train, y_train = self.train
+            train_loss, train_accuracy, _ = self.compute_loss_and_accuracy(X_train, y_train)
+            X_valid, y_valid = self.valid
+            valid_loss, valid_accuracy, _ = self.compute_loss_and_accuracy(X_valid, y_valid)
 
-        # sum gradient from the k examples
-        for j in range(minibatch_inputs.shape[0]):
-            input = minibatch_inputs[j].reshape((self.d,1))
-            self.fprop(input, minibatch_labels[j])
-            grads += self.bprop(input, minibatch_labels[j])
+            self.train_logs['train_accuracy'].append(train_accuracy)
+            self.train_logs['validation_accuracy'].append(valid_accuracy)
+            self.train_logs['train_loss'].append(train_loss)
+            self.train_logs['validation_loss'].append(valid_loss)
 
-        # use average gradients of the minibatch
-        grads = grads / minibatch_inputs.shape[0]
-        if debug:
-            return grads
-        self.gradient_descent(grads[0], grads[1], grads[2], grads[3])
+        return self.train_logs
 
-    def predict(self, x):
-        x =  x.reshape((self.d, 1))
-        self.fprop(x)
-        # print(self.os, y)
-        return float(np.argmax(self.os))
+    def evaluate(self):
+        X_test, y_test = self.test
+        return self.compute_loss_and_accuracy(X_test, y_test)[0:2]
 
-    def score(self,test_inputs, test_labels):
-        # Calcul du pourcentage d'exemple qui se fait correctement classifier
-        correct = 0
-        for i in range(test_inputs.shape[0]):
-            if self.predict(test_inputs[i]) == test_labels[i]:
-                correct = correct + 1
-        result = 'Taux de classification correcte: ' + str((correct / test_inputs.shape[0]) * 100) + '%'
-        return result
+if __name__ == "__main__":
+    model = NN(hidden_dims=(512, 256),
+                 datapath='cifar10.pkl',
+                 lr=0.003,
+                 batch_size=100,
+                 seed=0
+                 )
+    train_logs = model.train_loop(n_epochs=50)
+    for k in train_logs:
+        print(k, train_logs[k])
+    import matplotlib.pyplot as plt
 
-def show_grads(computed,estimate):
-    s = ['grad_b1', 'grad_w1', 'grad_b2', 'grad_w2']
-    for j in range(4):
-        print("ratio computed " + s[j] + " / estimation " + s[j])
-        print(computed[j] / estimate[j])
-        print('computed ' + s[j])
-        print(computed[j])
-        print(s[j])
-        print(estimate[j])
-        print()
-
-def softmax(a):
-    """
-    numerically stable softmax
-    :param a: vector dx1 or matrix dxn containing n vectors of length d
-    :return: vector dx1 or matrix dxn
-    """
-    # find the max for each column
-    max = np.max(a, axis=0)
-    a = a - max
-    a = np.exp(a)
-    sum = np.sum(a, axis=0)
-    a = a / sum
-    return a
-
-def initialize_weight(n_input,n2):
-    """
-    initialize weights of a layer with an uniform distribution [-1/n_input,1/n_input]
-    n_input = number of inputs for the layer
-    (bias is initialized to 0, so it's not initialize with this function)
-    :param n_input: number of columns = number of neurons in the layer before = number of neurons that give inputs
-    :param n2: number of rows = number of neurons in the layer 'after' or current layer = number of neurons that receive inputs
-    :return: weights matrix
-    """
-    n_input_sqrt = n_input**(0.5)
-    return np.random.uniform(-1/n_input_sqrt,1/n_input_sqrt,(n2,n_input))
-
-#decision regions
-def plot_decision_region(model, params, n=50):
-    fig = plt.figure()
-    n=n
-    x = np.linspace(-1,1,n)
-    y = np.linspace(-1,1,n)
-    xx, yy = np.meshgrid(x,y)
-    grid_dataset = np.column_stack((xx.ravel(),yy.ravel()))
-    pred = []
-    for e in grid_dataset:
-        pred.append(model.predict(e))
-    pred = np.array(pred)
-    pred = pred.reshape(xx.shape)
-    plt.contourf(xx,yy,pred)
-    fig.suptitle('decision region')
-    plt.title(params)
+    plt.plot(list(range(50)), train_logs['validation_accuracy'], label='Validation')
+    plt.plot(list(range(50)), train_logs['train_accuracy'], label='Training')
+    plt.legend()
+    plt.ylabel('Accuracy')
+    plt.xlabel('epochs')
     plt.show()
 
-
-
-model = Neural_network(2,10,2, epoch=10, step_size=0.01, lambda11=0,lambda12=0,lambda21=0,lambda22=0)
-model.train(train_inputs, train_labels)
-
-
-print('Finite difference gradient check for 1 example')
-model_check_gradient = Neural_network(2,3,2, epoch=10, step_size=0.01, lambda11=0,lambda12=0,lambda21=0,lambda22=0)
-model_check_gradient.train(train_inputs, train_labels)
-result_gradient_check = model_check_gradient.gradient_check(test_inputs[0],test_labels[0], True)
-print()
-
-# Give the average estimated gradient on 10 examples, the average computed gradient on the same examples
-# and the ratio (computed average / estimation average)
-print('Finite difference gradient check for 10 examples')
-model_check_minibatch_gradient = Neural_network(2,3,2, epoch=10, k=10, step_size=0.01, lambda11=0,lambda12=0,lambda21=0,lambda22=0)
-model_check_minibatch_gradient.train(train_inputs,train_labels)
-minibatch_inputs = train_inputs[0:10]
-minibatch_labels = train_labels[0:10]
-
-model_check_minibatch_gradient.gradient_check_minibatch(minibatch_inputs,minibatch_labels)
-
-# 5)
-print('Model 1: 10 hidden neurons, 10 epoch, step size = 0.01')
-print(model.score(test_inputs, test_labels))
-print()
-plot_decision_region(model, '10 hiddens, 10 epoch, step size = 0.01')
-
-model2 = Neural_network(2,4,2, epoch=10, step_size=0.01, lambda11=0,lambda12=0,lambda21=0,lambda22=0)
-model2.train(train_inputs, train_labels)
-print('Model 2: 4 hidden neurons, 10 epoch, step size = 0.01')
-print(model2.score(test_inputs, test_labels))
-print()
-plot_decision_region(model2, '4 hidden neurons')
-
-model3 = Neural_network(2,10,2, epoch=10, step_size=0.01, lambda11=0.01,lambda12=0,lambda21=0,lambda22=0)
-model3.train(train_inputs, train_labels)
-print('Model 3: 10 hidden neurons, 10 epoch, step size = 0.01, lambda11 = 0.01')
-print(model3.score(test_inputs, test_labels))
-print()
-plot_decision_region(model3, '10 hidden neurons, lambda11 = 0.01')
-
-model4 = Neural_network(2,10,2, epoch=10, step_size=0.01, lambda11=0,lambda12=0.01,lambda21=0,lambda22=0)
-model4.train(train_inputs, train_labels)
-print('Model 4: 10 hidden neurons, 10 epoch, step size = 0.01, lambda12 = 0.01')
-print(model4.score(test_inputs, test_labels))
-print()
-plot_decision_region(model4, 'lambda12 = 0.01')
-
-model5 = Neural_network(2,10,2, epoch=10, step_size=0.01, lambda11=0,lambda12=0,lambda21=0.01,lambda22=0)
-model5.train(train_inputs, train_labels)
-print('Model 5: 10 hidden neurons, 10 epoch, step size = 0.01, lambda21 = 0.01')
-print(model5.score(test_inputs, test_labels))
-print()
-plot_decision_region(model5, 'lambda21 = 0.01')
-
-model6 = Neural_network(2,10,2, epoch=10, step_size=0.01, lambda11=0,lambda12=0,lambda21=0,lambda22=0.01)
-model6.train(train_inputs, train_labels)
-print('Model 6: 10 hidden neurons, 10 epoch, step size = 0.01, lambda22 = 0.01')
-print(model6.score(test_inputs, test_labels))
-print()
-plot_decision_region(model6, 'lambda22 = 0.01')
+    plt.plot(list(range(50)), train_logs['validation_loss'], label='Validation')
+    plt.plot(list(range(50)), train_logs['train_loss'], label='Training')
+    plt.legend()
+    plt.ylabel('Loss')
+    plt.xlabel('epochs')
+    plt.show()
